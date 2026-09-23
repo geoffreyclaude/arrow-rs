@@ -1019,7 +1019,141 @@ fn abs_checked<T: DecimalType>(value: T::Native) -> Result<T::Native, ArrowError
     }
 }
 
-/// Perform arithmetic operation on decimal arrays
+#[derive(Clone, Copy)]
+struct DecimalMetadata {
+    precision: u8,
+    scale: i8,
+}
+
+/// Result metadata and multipliers for aligning two decimal coefficients.
+struct DecimalRescale<T: DecimalType> {
+    metadata: DecimalMetadata,
+    left_multiplier: T::Native,
+    right_multiplier: T::Native,
+}
+
+// Follow the Hive decimal arithmetic rules:
+// https://cwiki.apache.org/confluence/download/attachments/27362075/Hive_Decimal_Precision_Scale_Support.pdf
+// Final result metadata validation remains in callers after coefficient arithmetic.
+fn prepare_decimal_add_sub<T: DecimalType>(
+    left: DecimalMetadata,
+    right: DecimalMetadata,
+) -> Result<DecimalRescale<T>, ArrowError> {
+    let scale = left.scale.max(right.scale);
+    // max(s1, s2) + max(p1 - s1, p2 - s2) + 1
+    let precision = (i16::from(scale)
+        + (i16::from(left.precision) - i16::from(left.scale))
+            .max(i16::from(right.precision) - i16::from(right.scale))
+        + 1)
+    .min(i16::from(T::MAX_PRECISION)) as u8;
+    // Equal scales need no rescaling.
+    let (left_multiplier, right_multiplier) = if left.scale == right.scale {
+        (T::Native::ONE, T::Native::ONE)
+    } else {
+        (
+            T::Native::usize_as(10)
+                .pow_checked((i16::from(scale) - i16::from(left.scale)) as u32)?,
+            T::Native::usize_as(10)
+                .pow_checked((i16::from(scale) - i16::from(right.scale)) as u32)?,
+        )
+    };
+    Ok(DecimalRescale {
+        metadata: DecimalMetadata { precision, scale },
+        left_multiplier,
+        right_multiplier,
+    })
+}
+
+fn prepare_decimal_mul<T: DecimalType>(
+    left: DecimalMetadata,
+    right: DecimalMetadata,
+) -> Result<DecimalMetadata, ArrowError> {
+    let precision = left
+        .precision
+        .saturating_add(right.precision + 1)
+        .min(T::MAX_PRECISION);
+    let scale = left.scale.saturating_add(right.scale);
+    if scale > T::MAX_SCALE {
+        // SQL requires an error instead of rounding an excessive product scale.
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "Output scale of {} * {} would exceed max scale of {}",
+            T::TYPE_CONSTRUCTOR(left.precision, left.scale),
+            T::TYPE_CONSTRUCTOR(right.precision, right.scale),
+            T::MAX_SCALE
+        )));
+    }
+    Ok(DecimalMetadata { precision, scale })
+}
+
+struct DecimalDivision<T: DecimalType> {
+    metadata: DecimalMetadata,
+    left_multiplier: T::Native,
+    right_multiplier: T::Native,
+    // The power of ten applied to the numerator relative to the denominator.
+    exponent: i8,
+}
+
+impl<T: DecimalType> DecimalDivision<T> {
+    #[inline(always)]
+    fn divide(&self, left: T::Native, right: T::Native) -> Result<T::Native, ArrowError> {
+        match left.mul_checked(self.left_multiplier) {
+            Ok(scaled) => scaled.div_checked(right.mul_checked(self.right_multiplier)?),
+            Err(_) => scaled_div::<T>(left, right, self.exponent),
+        }
+    }
+}
+
+fn prepare_decimal_div<T: DecimalType>(
+    left: DecimalMetadata,
+    right: DecimalMetadata,
+) -> Result<DecimalDivision<T>, ArrowError> {
+    // Follow PostgreSQL and MySQL, adding a fixed scale increment of four.
+    let scale = left.scale.saturating_add(4).min(T::MAX_SCALE);
+    let exponent = scale - left.scale + right.scale;
+    // p1 - s1 + s2 + result_scale
+    let precision = (exponent.saturating_add(left.precision as i8) as u8).min(T::MAX_PRECISION);
+    let (left_multiplier, right_multiplier) = match exponent.cmp(&0) {
+        Ordering::Greater => (
+            T::Native::usize_as(10).pow_checked(exponent as _)?,
+            T::Native::ONE,
+        ),
+        Ordering::Equal => (T::Native::ONE, T::Native::ONE),
+        Ordering::Less => (
+            T::Native::ONE,
+            T::Native::usize_as(10).pow_checked((-i16::from(exponent)) as u32)?,
+        ),
+    };
+    Ok(DecimalDivision {
+        metadata: DecimalMetadata { precision, scale },
+        left_multiplier,
+        right_multiplier,
+        exponent,
+    })
+}
+
+fn prepare_decimal_rem<T: DecimalType>(
+    left: DecimalMetadata,
+    right: DecimalMetadata,
+) -> DecimalRescale<T> {
+    let scale = left.scale.max(right.scale);
+    // min(p1 - s1, p2 - s2) + max(s1, s2)
+    let precision = (i16::from(scale)
+        + (i16::from(left.precision) - i16::from(left.scale))
+            .min(i16::from(right.precision) - i16::from(right.scale)))
+    .min(i16::from(T::MAX_PRECISION)) as u8;
+    // Preserve the array remainder kernel's wrapping rescaling factors.
+    let left_multiplier =
+        T::Native::usize_as(10).pow_wrapping((i16::from(scale) - i16::from(left.scale)) as u32);
+    let right_multiplier =
+        T::Native::usize_as(10).pow_wrapping((i16::from(scale) - i16::from(right.scale)) as u32);
+    DecimalRescale {
+        metadata: DecimalMetadata { precision, scale },
+        left_multiplier,
+        right_multiplier,
+    }
+}
+
+/// Perform arithmetic operation on decimal arrays.
 fn decimal_op<T: DecimalType>(
     op: Op,
     l: &dyn Array,
@@ -1029,39 +1163,25 @@ fn decimal_op<T: DecimalType>(
 ) -> Result<ArrayRef, ArrowError> {
     let l = l.as_primitive::<T>();
     let r = r.as_primitive::<T>();
-
-    let (p1, s1, p2, s2) = match (l.data_type(), r.data_type()) {
-        (DataType::Decimal32(p1, s1), DataType::Decimal32(p2, s2)) => (p1, s1, p2, s2),
-        (DataType::Decimal64(p1, s1), DataType::Decimal64(p2, s2)) => (p1, s1, p2, s2),
-        (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => (p1, s1, p2, s2),
-        (DataType::Decimal256(p1, s1), DataType::Decimal256(p2, s2)) => (p1, s1, p2, s2),
-        _ => unreachable!(),
+    let left = DecimalMetadata {
+        precision: l.precision(),
+        scale: l.scale(),
+    };
+    let right = DecimalMetadata {
+        precision: r.precision(),
+        scale: r.scale(),
     };
 
-    // Follow the Hive decimal arithmetic rules
-    // https://cwiki.apache.org/confluence/download/attachments/27362075/Hive_Decimal_Precision_Scale_Support.pdf
-    let array: PrimitiveArray<T> = match op {
+    // Dispatch and scale preparation stay outside the array loops.
+    let (array, metadata): (PrimitiveArray<T>, _) = match op {
         Op::Add | Op::AddWrapping | Op::Sub | Op::SubWrapping => {
-            // max(s1, s2)
-            let result_scale = *s1.max(s2);
-
-            // max(s1, s2) + max(p1-s1, p2-s2) + 1
-            let result_precision = (i16::from(result_scale)
-                + (i16::from(*p1) - i16::from(*s1)).max(i16::from(*p2) - i16::from(*s2))
-                + 1)
-            .min(i16::from(T::MAX_PRECISION)) as u8;
-
-            let l_mul = T::Native::usize_as(10)
-                .pow_checked((i16::from(result_scale) - i16::from(*s1)) as u32)?;
-            let r_mul = T::Native::usize_as(10)
-                .pow_checked((i16::from(result_scale) - i16::from(*s2)) as u32)?;
-
-            match op {
+            let rescale = prepare_decimal_add_sub::<T>(left, right)?;
+            let array = match op {
                 // Equal scales make both decimal multipliers one.
-                Op::Add | Op::AddWrapping if s1 == s2 => {
+                Op::Add | Op::AddWrapping if left.scale == right.scale => {
                     try_op!(l, l_s, r, r_s, l.add_checked(r))
                 }
-                Op::Sub | Op::SubWrapping if s1 == s2 => {
+                Op::Sub | Op::SubWrapping if left.scale == right.scale => {
                     try_op!(l, l_s, r, r_s, l.sub_checked(r))
                 }
                 Op::Add | Op::AddWrapping => {
@@ -1070,7 +1190,8 @@ fn decimal_op<T: DecimalType>(
                         l_s,
                         r,
                         r_s,
-                        l.mul_checked(l_mul)?.add_checked(r.mul_checked(r_mul)?)
+                        l.mul_checked(rescale.left_multiplier)?
+                            .add_checked(r.mul_checked(rescale.right_multiplier)?)
                     )
                 }
                 Op::Sub | Op::SubWrapping => {
@@ -1079,90 +1200,42 @@ fn decimal_op<T: DecimalType>(
                         l_s,
                         r,
                         r_s,
-                        l.mul_checked(l_mul)?.sub_checked(r.mul_checked(r_mul)?)
+                        l.mul_checked(rescale.left_multiplier)?
+                            .sub_checked(r.mul_checked(rescale.right_multiplier)?)
                     )
                 }
                 _ => unreachable!(),
-            }
-            .with_precision_and_scale(result_precision, result_scale)?
+            };
+            (array, rescale.metadata)
         }
         Op::Mul | Op::MulWrapping => {
-            let result_precision = p1.saturating_add(p2 + 1).min(T::MAX_PRECISION);
-            let result_scale = s1.saturating_add(*s2);
-            if result_scale > T::MAX_SCALE {
-                // SQL standard says that if the resulting scale of a multiply operation goes
-                // beyond the maximum, rounding is not acceptable and thus an error occurs
-                return Err(ArrowError::InvalidArgumentError(format!(
-                    "Output scale of {} {op} {} would exceed max scale of {}",
-                    l.data_type(),
-                    r.data_type(),
-                    T::MAX_SCALE
-                )));
-            }
-
-            try_op!(l, l_s, r, r_s, l.mul_checked(r))
-                .with_precision_and_scale(result_precision, result_scale)?
+            let metadata = prepare_decimal_mul::<T>(left, right)?;
+            (try_op!(l, l_s, r, r_s, l.mul_checked(r)), metadata)
         }
-
         Op::Div => {
-            // Follow postgres and MySQL adding a fixed scale increment of 4
-            // s1 + 4
-            let result_scale = s1.saturating_add(4).min(T::MAX_SCALE);
-            let mul_pow = result_scale - s1 + s2;
-
-            // p1 - s1 + s2 + result_scale
-            let result_precision = (mul_pow.saturating_add(*p1 as i8) as u8).min(T::MAX_PRECISION);
-
-            let (l_mul, r_mul) = match mul_pow.cmp(&0) {
-                Ordering::Greater => (
-                    T::Native::usize_as(10).pow_checked(mul_pow as _)?,
-                    T::Native::ONE,
-                ),
-                Ordering::Equal => (T::Native::ONE, T::Native::ONE),
-                Ordering::Less => (
-                    T::Native::ONE,
-                    T::Native::usize_as(10).pow_checked((-i16::from(mul_pow)) as u32)?,
-                ),
-            };
-
-            try_op!(
-                l,
-                l_s,
-                r,
-                r_s,
-                match l.mul_checked(l_mul) {
-                    Ok(scaled) => scaled.div_checked(r.mul_checked(r_mul)?),
-                    Err(_) => scaled_div::<T>(l, r, mul_pow),
-                }
+            let division = prepare_decimal_div::<T>(left, right)?;
+            (
+                try_op!(l, l_s, r, r_s, division.divide(l, r)),
+                division.metadata,
             )
-            .with_precision_and_scale(result_precision, result_scale)?
         }
-
         Op::Rem => {
-            // max(s1, s2)
-            let result_scale = *s1.max(s2);
-            // min(p1-s1, p2 -s2) + max( s1,s2 )
-            let result_precision = (i16::from(result_scale)
-                + (i16::from(*p1) - i16::from(*s1)).min(i16::from(*p2) - i16::from(*s2)))
-            .min(i16::from(T::MAX_PRECISION)) as u8;
-
-            let l_mul = T::Native::usize_as(10)
-                .pow_wrapping((i16::from(result_scale) - i16::from(*s1)) as u32);
-            let r_mul = T::Native::usize_as(10)
-                .pow_wrapping((i16::from(result_scale) - i16::from(*s2)) as u32);
-
-            try_op!(
+            let rescale = prepare_decimal_rem::<T>(left, right);
+            let array = try_op!(
                 l,
                 l_s,
                 r,
                 r_s,
-                l.mul_checked(l_mul)?.mod_checked(r.mul_checked(r_mul)?)
-            )
-            .with_precision_and_scale(result_precision, result_scale)?
+                l.mul_checked(rescale.left_multiplier)?
+                    .mod_checked(r.mul_checked(rescale.right_multiplier)?)
+            );
+            (array, rescale.metadata)
         }
     };
-
-    Ok(Arc::new(array))
+    Ok(Arc::new(array.with_precision_and_scale(
+        metadata.precision,
+        metadata.scale,
+    )?))
 }
 
 #[cfg(test)]
