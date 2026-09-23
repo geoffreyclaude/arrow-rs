@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Defines numeric arithmetic kernels on [`PrimitiveArray`], such as [`add`]
+//! Numeric arithmetic on arrays and scalar values.
+//!
+//! Array kernels such as [`add`] accept arrays or broadcast [`Scalar`] inputs.
+//! [`decimal_scalar`] applies decimal arithmetic to native coefficients without
+//! allocating arrays. For raw arithmetic, see [`ArrowNativeTypeOp`].
 
 use std::cmp::Ordering;
 use std::fmt::Formatter;
@@ -1237,6 +1241,117 @@ fn decimal_op<T: DecimalType>(
         metadata.scale,
     )?))
 }
+
+/// Arithmetic operations supported by [`decimal_scalar`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DecimalOp {
+    /// Add the operands after aligning their scales.
+    Add,
+    /// Subtract the right operand after aligning their scales.
+    Sub,
+    /// Multiply without rounding the resulting scale.
+    Mul,
+    /// Divide using the array kernel's result scale.
+    Div,
+    /// Compute the remainder after aligning the operands' scales.
+    Rem,
+}
+
+/// Apply decimal arithmetic to nullable coefficients without constructing arrays.
+///
+/// Inputs and output contain a coefficient, precision, and scale. Input metadata
+/// is validated before arithmetic. Null inputs skip coefficient arithmetic, but
+/// scale preparation and output metadata validation can still fail.
+///
+/// Uses the array kernels' precision, scale, and checked-overflow rules.
+/// Like [`PrimitiveArray::with_precision_and_scale`],
+/// this does not check that each coefficient fits its declared precision.
+///
+/// ```
+/// use arrow_arith::numeric::{DecimalOp, decimal_scalar};
+/// use arrow_array::types::Decimal128Type;
+///
+/// // 1.23 * 2 = 2.46
+/// let result = decimal_scalar::<Decimal128Type>(
+///     DecimalOp::Mul, (Some(123), 5, 2), (Some(2), 2, 0),
+/// )?;
+/// assert_eq!(result, (Some(246), 8, 2));
+/// # Ok::<(), arrow_schema::ArrowError>(())
+/// ```
+pub fn decimal_scalar<T: DecimalType>(
+    op: DecimalOp,
+    left: (Option<T::Native>, u8, i8),
+    right: (Option<T::Native>, u8, i8),
+) -> Result<(Option<T::Native>, u8, i8), ArrowError> {
+    let (left, left_precision, left_scale) = left;
+    let (right, right_precision, right_scale) = right;
+    validate_decimal_precision_and_scale::<T>(left_precision, left_scale)?;
+    validate_decimal_precision_and_scale::<T>(right_precision, right_scale)?;
+    let left_metadata = DecimalMetadata {
+        precision: left_precision,
+        scale: left_scale,
+    };
+    let right_metadata = DecimalMetadata {
+        precision: right_precision,
+        scale: right_scale,
+    };
+    let operands = left.zip(right);
+
+    // Prepare scales even for null operands; only coefficient arithmetic is skipped.
+    let (value, metadata) = match op {
+        DecimalOp::Add | DecimalOp::Sub => {
+            let rescale = prepare_decimal_add_sub::<T>(left_metadata, right_metadata)?;
+            let value = match op {
+                DecimalOp::Add if left_scale == right_scale => {
+                    operands.map(|(left, right)| left.add_checked(right))
+                }
+                DecimalOp::Sub if left_scale == right_scale => {
+                    operands.map(|(left, right)| left.sub_checked(right))
+                }
+                DecimalOp::Add => operands.map(|(left, right)| {
+                    left.mul_checked(rescale.left_multiplier)?
+                        .add_checked(right.mul_checked(rescale.right_multiplier)?)
+                }),
+                DecimalOp::Sub => operands.map(|(left, right)| {
+                    left.mul_checked(rescale.left_multiplier)?
+                        .sub_checked(right.mul_checked(rescale.right_multiplier)?)
+                }),
+                _ => unreachable!(),
+            }
+            .transpose()?;
+            (value, rescale.metadata)
+        }
+        DecimalOp::Mul => {
+            let metadata = prepare_decimal_mul::<T>(left_metadata, right_metadata)?;
+            let value = operands
+                .map(|(left, right)| left.mul_checked(right))
+                .transpose()?;
+            (value, metadata)
+        }
+        DecimalOp::Div => {
+            let division = prepare_decimal_div::<T>(left_metadata, right_metadata)?;
+            let value = operands
+                .map(|(left, right)| division.divide(left, right))
+                .transpose()?;
+            (value, division.metadata)
+        }
+        DecimalOp::Rem => {
+            let rescale = prepare_decimal_rem::<T>(left_metadata, right_metadata);
+            let value = operands
+                .map(|(left, right)| {
+                    left.mul_checked(rescale.left_multiplier)?
+                        .mod_checked(right.mul_checked(rescale.right_multiplier)?)
+                })
+                .transpose()?;
+            (value, rescale.metadata)
+        }
+    };
+    validate_decimal_precision_and_scale::<T>(metadata.precision, metadata.scale)?;
+    Ok((value, metadata.precision, metadata.scale))
+}
+
+#[cfg(test)]
+mod decimal_tests;
 
 #[cfg(test)]
 mod tests {

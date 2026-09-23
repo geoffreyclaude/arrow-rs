@@ -17,49 +17,13 @@
 
 use std::hint;
 
-use arrow_arith::numeric::{add, div, mul, rem, sub};
-use arrow_array::cast::AsArray;
+use arrow_arith::numeric::{DecimalOp, add, decimal_scalar, div, mul, rem, sub};
+use arrow_array::PrimitiveArray;
 use arrow_array::types::{
     Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, DecimalType,
 };
-use arrow_array::{Array, PrimitiveArray};
 use arrow_buffer::ArrowNativeType;
-use arrow_schema::ArrowError;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-
-// Benchmark-local baseline for the scalar API. The scalar implementation commit
-// replaces this array-backed adapter with the allocation-free public API.
-#[derive(Clone, Copy)]
-enum DecimalOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Rem,
-}
-
-fn decimal_scalar<T: DecimalType>(
-    op: DecimalOp,
-    left: (Option<T::Native>, u8, i8),
-    right: (Option<T::Native>, u8, i8),
-) -> Result<(Option<T::Native>, u8, i8), ArrowError> {
-    let left = PrimitiveArray::<T>::from_iter([left.0]).with_precision_and_scale(left.1, left.2)?;
-    let right =
-        PrimitiveArray::<T>::from_iter([right.0]).with_precision_and_scale(right.1, right.2)?;
-    let result = match op {
-        DecimalOp::Add => add(&left, &right),
-        DecimalOp::Sub => sub(&left, &right),
-        DecimalOp::Mul => mul(&left, &right),
-        DecimalOp::Div => div(&left, &right),
-        DecimalOp::Rem => rem(&left, &right),
-    }?;
-    let result = result.as_primitive::<T>();
-    Ok((
-        (!result.is_null(0)).then(|| result.value(0)),
-        result.precision(),
-        result.scale(),
-    ))
-}
 
 macro_rules! decimal_operation {
     ($group:ident, $type:ty, $name:expr, $op:expr, $kernel:ident, $left:expr, $right:expr) => {{
