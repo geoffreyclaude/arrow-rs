@@ -1046,13 +1046,15 @@ fn decimal_op<T: DecimalType>(
             let result_scale = *s1.max(s2);
 
             // max(s1, s2) + max(p1-s1, p2-s2) + 1
-            let result_precision =
-                (result_scale.saturating_add((*p1 as i8 - s1).max(*p2 as i8 - s2)) as u8)
-                    .saturating_add(1)
-                    .min(T::MAX_PRECISION);
+            let result_precision = (i16::from(result_scale)
+                + (i16::from(*p1) - i16::from(*s1)).max(i16::from(*p2) - i16::from(*s2))
+                + 1)
+            .min(i16::from(T::MAX_PRECISION)) as u8;
 
-            let l_mul = T::Native::usize_as(10).pow_checked((result_scale - s1) as _)?;
-            let r_mul = T::Native::usize_as(10).pow_checked((result_scale - s2) as _)?;
+            let l_mul = T::Native::usize_as(10)
+                .pow_checked((i16::from(result_scale) - i16::from(*s1)) as u32)?;
+            let r_mul = T::Native::usize_as(10)
+                .pow_checked((i16::from(result_scale) - i16::from(*s2)) as u32)?;
 
             match op {
                 // Equal scales make both decimal multipliers one.
@@ -1119,7 +1121,7 @@ fn decimal_op<T: DecimalType>(
                 Ordering::Equal => (T::Native::ONE, T::Native::ONE),
                 Ordering::Less => (
                     T::Native::ONE,
-                    T::Native::usize_as(10).pow_checked(mul_pow.neg_wrapping() as _)?,
+                    T::Native::usize_as(10).pow_checked((-i16::from(mul_pow)) as u32)?,
                 ),
             };
 
@@ -1140,12 +1142,14 @@ fn decimal_op<T: DecimalType>(
             // max(s1, s2)
             let result_scale = *s1.max(s2);
             // min(p1-s1, p2 -s2) + max( s1,s2 )
-            let result_precision =
-                (result_scale.saturating_add((*p1 as i8 - s1).min(*p2 as i8 - s2)) as u8)
-                    .min(T::MAX_PRECISION);
+            let result_precision = (i16::from(result_scale)
+                + (i16::from(*p1) - i16::from(*s1)).min(i16::from(*p2) - i16::from(*s2)))
+            .min(i16::from(T::MAX_PRECISION)) as u8;
 
-            let l_mul = T::Native::usize_as(10).pow_wrapping((result_scale - s1) as _);
-            let r_mul = T::Native::usize_as(10).pow_wrapping((result_scale - s2) as _);
+            let l_mul = T::Native::usize_as(10)
+                .pow_wrapping((i16::from(result_scale) - i16::from(*s1)) as u32);
+            let r_mul = T::Native::usize_as(10)
+                .pow_wrapping((i16::from(result_scale) - i16::from(*s2)) as u32);
 
             try_op!(
                 l,
@@ -1532,6 +1536,55 @@ mod tests {
         assert_eq!(err, "Divide by zero error");
         let err = rem(&a, &b).unwrap_err().to_string();
         assert_eq!(err, "Divide by zero error");
+    }
+
+    #[test]
+    fn test_decimal_extreme_negative_scale() {
+        fn check<T: DecimalType>() {
+            let left = PrimitiveArray::<T>::from_iter([Some(T::Native::usize_as(3)), None])
+                .with_precision_and_scale(1, i8::MIN)
+                .unwrap();
+            let right = PrimitiveArray::<T>::from_iter([Some(T::Native::usize_as(2)); 2])
+                .with_precision_and_scale(1, i8::MIN)
+                .unwrap();
+            let right_scalar = Scalar::new(right.slice(0, 1));
+            let null_scalar = Scalar::new(left.slice(1, 1));
+            for (op, coefficient, precision) in [(Op::Add, 5, 2), (Op::Sub, 1, 2), (Op::Rem, 1, 1)]
+            {
+                let expected =
+                    PrimitiveArray::<T>::from_iter([Some(T::Native::usize_as(coefficient)), None])
+                        .with_precision_and_scale(precision, i8::MIN)
+                        .unwrap();
+                for right in [&right as &dyn Datum, &right_scalar] {
+                    let result = arithmetic_op(op, &left, right).unwrap();
+                    assert_eq!(result.as_primitive::<T>(), &expected);
+                }
+                let result = arithmetic_op(op, &null_scalar, &right_scalar).unwrap();
+                assert_eq!(result.as_primitive::<T>(), &expected.slice(1, 1));
+            }
+
+            let right = PrimitiveArray::<T>::from_iter([Some(T::Native::ONE)])
+                .with_precision_and_scale(1, 0)
+                .unwrap();
+            let error = add(&left, &Scalar::new(right)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Arithmetic overflow: Overflow happened on: 10 ^ 128",
+            );
+            let high_scale = PrimitiveArray::<T>::from_iter([Some(T::Native::ONE)])
+                .with_precision_and_scale(T::MAX_PRECISION, T::MAX_SCALE)
+                .unwrap();
+            let error = div(&high_scale, &right_scalar).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Arithmetic overflow: Overflow happened on: 10 ^ 128",
+            );
+        }
+
+        check::<Decimal32Type>();
+        check::<Decimal64Type>();
+        check::<Decimal128Type>();
+        check::<Decimal256Type>();
     }
 
     #[test]
