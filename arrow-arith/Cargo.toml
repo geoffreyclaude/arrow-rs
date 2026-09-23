@@ -50,5 +50,9 @@ criterion = { workspace = true }
 name = "decimal_arithmetic"
 harness = false
 
+[[bench]]
+name = "scalar_arithmetic"
+harness = false
+
 [lints]
 workspace = true

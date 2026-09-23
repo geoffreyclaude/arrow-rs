@@ -17,7 +17,7 @@
 
 use std::hint;
 
-use arrow_arith::numeric::{add, sub};
+use arrow_arith::numeric::{add, div, mul, rem, sub};
 use arrow_array::PrimitiveArray;
 use arrow_array::types::{
     Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, DecimalType,
@@ -50,6 +50,15 @@ fn benchmark<T: DecimalType>(c: &mut Criterion, name: &str) {
         });
         group.bench_function("sub", |b| {
             b.iter(|| hint::black_box(sub(&left, &right).unwrap()))
+        });
+        group.bench_function("mul", |b| {
+            b.iter(|| hint::black_box(mul(&left, &right).unwrap()))
+        });
+        group.bench_function("div", |b| {
+            b.iter(|| hint::black_box(div(&left, &right).unwrap()))
+        });
+        group.bench_function("rem", |b| {
+            b.iter(|| hint::black_box(rem(&left, &right).unwrap()))
         });
         group.finish();
     }
