@@ -32,18 +32,17 @@ fn compare_run_end_encoded<R: RunEndIndexType>(
     let left = left.as_run::<R>();
     let right = right.as_run::<R>();
 
-    let c_opts = child_opts(opts);
-    let cmp = make_comparator(left.values().as_ref(), right.values().as_ref(), c_opts)?;
+    let cmp = make_comparator(left.values().as_ref(), right.values().as_ref(), opts)?;
 
     let l_run_ends = left.run_ends().clone();
     let r_run_ends = right.run_ends().clone();
 
-    let f = compare(left, right, opts, move |i, j| {
+    let f = move |i, j| {
         let l_physical = l_run_ends.get_physical_index(i);
         let r_physical = r_run_ends.get_physical_index(j);
         cmp(l_physical, r_physical)
-    });
-    Ok(f)
+    };
+    Ok(Box::new(f))
 }
 
 /// Compare the values at two arbitrary indices in two arrays.
@@ -400,7 +399,9 @@ fn compare_union(
     let left_offsets = left.offsets().cloned();
     let right_offsets = right.offsets().cloned();
 
-    let f = compare(left, right, opts, move |i, j| {
+    // Union nulls belong to the active child. Compare type IDs before child
+    // nullness so differently tagged nulls retain their union ordering.
+    let f = move |i: usize, j: usize| {
         let left_type_id = left_type_ids[i];
         let right_type_id = right_type_ids[j];
 
@@ -419,8 +420,12 @@ fn compare_union(
             }
             other => other,
         }
-    });
-    Ok(f)
+    };
+    if opts.descending {
+        Ok(Box::new(move |i, j| f(i, j).reverse()))
+    } else {
+        Ok(Box::new(f))
+    }
 }
 
 /// Returns a comparison function that compares two values at two different positions
@@ -430,6 +435,9 @@ fn compare_union(
 ///
 /// If `nulls_first` is true `NULL` values will be considered less than any non-null value,
 /// otherwise they will be considered greater.
+///
+/// Union values are ordered by type ID first, including when the active child is null.
+/// Values with the same type ID use the child ordering, where `nulls_first` applies.
 ///
 /// # Basic Usage
 ///
@@ -1517,6 +1525,86 @@ mod tests {
         assert_eq!(cmp(0, 2), Ordering::Less); // 1 < 3
         // array[0] = (type_id=0, value=1), array[1] = (type_id=1, value="b")
         assert_eq!(cmp(0, 1), Ordering::Less); // type_id 0 < 1
+    }
+
+    #[test]
+    fn test_union_null_ordering() {
+        for dense in [false, true] {
+            let fields = UnionFields::try_new(
+                [5, 2, 9],
+                [
+                    Field::new("int", DataType::Int32, true),
+                    Field::new("str", DataType::Utf8, true),
+                    Field::new("null", DataType::Null, true),
+                ],
+            )
+            .unwrap();
+            let children: Vec<ArrayRef> = if dense {
+                vec![
+                    Arc::new(Int32Array::from(vec![None, Some(1), Some(2)])),
+                    Arc::new(StringArray::from(vec![None, Some("a"), Some("b")])),
+                    Arc::new(NullArray::new(2)),
+                ]
+            } else {
+                vec![
+                    Arc::new(Int32Array::from(vec![
+                        None,
+                        None,
+                        Some(1),
+                        None,
+                        Some(2),
+                        None,
+                        None,
+                        None,
+                    ])),
+                    Arc::new(StringArray::from(vec![
+                        None,
+                        None,
+                        None,
+                        Some("a"),
+                        None,
+                        Some("b"),
+                        None,
+                        None,
+                    ])),
+                    Arc::new(NullArray::new(8)),
+                ]
+            };
+            let array = UnionArray::try_new(
+                fields,
+                vec![5, 2, 5, 2, 5, 2, 9, 9].into(),
+                dense.then(|| vec![0, 0, 1, 1, 2, 2, 0, 1].into()),
+                children,
+            )
+            .unwrap();
+            let sliced = array.slice(1, 7);
+            for (descending, nulls_first, ranks) in [
+                (false, true, [3, 0, 4, 1, 5, 2, 6, 6]),
+                (false, false, [5, 2, 3, 0, 4, 1, 6, 6]),
+                (true, true, [1, 4, 3, 6, 2, 5, 0, 0]),
+                (true, false, [3, 6, 2, 5, 1, 4, 0, 0]),
+            ] {
+                let options = SortOptions {
+                    descending,
+                    nulls_first,
+                };
+                let compare = make_comparator(&array, &array, options).unwrap();
+                let compare_sliced = make_comparator(&array, &sliced, options).unwrap();
+                for i in 0..array.len() {
+                    for j in 0..array.len() {
+                        let expected = ranks[i].cmp(&ranks[j]);
+                        assert_eq!(
+                            compare(i, j),
+                            expected,
+                            "dense={dense}, {options:?}, ({i}, {j})"
+                        );
+                        if j > 0 {
+                            assert_eq!(compare_sliced(i, j - 1), expected);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -727,20 +727,13 @@ impl Codec {
                 Ok(Self::Struct(converter, owned))
             }
             DataType::Union(fields, _mode) => {
-                // similar to dictionaries and lists, we set descending to false and negate nulls_first
-                // since the encoded contents will be inverted if descending is set
-                let options = SortOptions {
-                    descending: false,
-                    nulls_first: sort_field.options.nulls_first != sort_field.options.descending,
-                };
-
                 let mut converters = Vec::with_capacity(fields.len());
                 let mut type_ids = Vec::with_capacity(fields.len());
                 let mut null_rows = Vec::with_capacity(fields.len());
 
                 for (type_id, field) in fields.iter() {
                     let sort_field =
-                        SortField::new_with_options(field.data_type().clone(), options);
+                        SortField::new_with_options(field.data_type().clone(), sort_field.options);
                     let converter = RowConverter::new(vec![sort_field])?;
 
                     let null_array = new_null_array(field.data_type(), 1);
@@ -5753,6 +5746,140 @@ mod tests {
         // among strigns
         // "a" < "z"
         assert!(rows.row(3) < rows.row(1));
+    }
+
+    #[test]
+    fn test_union_null_ordering_matches_comparator() {
+        for dense in [false, true] {
+            let fields = UnionFields::try_new(
+                [0, 1],
+                [
+                    Field::new("int", DataType::Int32, true),
+                    Field::new("str", DataType::Utf8, true),
+                ],
+            )
+            .unwrap();
+            let children: Vec<ArrayRef> = if dense {
+                vec![
+                    Arc::new(Int32Array::from(vec![None, Some(2), None, Some(1)])),
+                    Arc::new(StringArray::from(vec![None, Some("b"), None, Some("a")])),
+                ]
+            } else {
+                vec![
+                    Arc::new(Int32Array::from(vec![
+                        None,
+                        None,
+                        Some(2),
+                        None,
+                        None,
+                        None,
+                        Some(1),
+                        None,
+                    ])),
+                    Arc::new(StringArray::from(vec![
+                        None,
+                        None,
+                        None,
+                        Some("b"),
+                        None,
+                        None,
+                        None,
+                        Some("a"),
+                    ])),
+                ]
+            };
+            let union: ArrayRef = Arc::new(
+                UnionArray::try_new(
+                    fields,
+                    vec![0, 1, 0, 1, 0, 1, 0, 1].into(),
+                    dense.then(|| vec![0, 0, 1, 1, 2, 2, 3, 3].into()),
+                    children,
+                )
+                .unwrap(),
+            );
+            let field = Arc::new(Field::new("union", union.data_type().clone(), true));
+            let nulls = Some(NullBuffer::from(vec![
+                true, true, false, true, true, true, false, true,
+            ]));
+            let nested_struct: ArrayRef = Arc::new(StructArray::new(
+                vec![field.clone()].into(),
+                vec![union.clone()],
+                nulls.clone(),
+            ));
+            let nested_list: ArrayRef = Arc::new(ListArray::new(
+                field,
+                OffsetBuffer::new((0..=8).collect::<Vec<i32>>().into()),
+                union.clone(),
+                nulls,
+            ));
+            let nested_union: ArrayRef = Arc::new(
+                UnionArray::try_new(
+                    UnionFields::try_new(
+                        [3, 1],
+                        [
+                            Field::new("union", union.data_type().clone(), true),
+                            Field::new("null", DataType::Null, true),
+                        ],
+                    )
+                    .unwrap(),
+                    vec![3, 3, 3, 1, 3, 3, 1, 3].into(),
+                    None,
+                    vec![union.clone(), Arc::new(NullArray::new(8))],
+                )
+                .unwrap(),
+            );
+            let nested_run: ArrayRef = Arc::new(
+                RunArray::<Int32Type>::try_new(
+                    &Int32Array::from(vec![2, 4, 6, 8, 10, 12, 14, 16]),
+                    union.as_ref(),
+                )
+                .unwrap(),
+            );
+            for array in [union, nested_struct, nested_list, nested_union, nested_run] {
+                for options in all_sort_options() {
+                    let converter = RowConverter::new(vec![SortField::new_with_options(
+                        array.data_type().clone(),
+                        options,
+                    )])
+                    .unwrap();
+                    let rows = converter.convert_columns(&[array.clone()]).unwrap();
+                    let sliced = array.slice(1, 6);
+                    let sliced_rows = converter.convert_columns(&[sliced.clone()]).unwrap();
+                    for (view, view_rows) in [(&array, &rows), (&sliced, &sliced_rows)] {
+                        let roundtrip = converter.convert_rows(view_rows).unwrap();
+                        let roundtrip_rows = converter.convert_columns(&roundtrip).unwrap();
+                        assert_eq!(
+                            view_rows.iter().collect::<Vec<_>>(),
+                            roundtrip_rows.iter().collect::<Vec<_>>(),
+                        );
+                        assert_eq!(view.logical_nulls(), roundtrip[0].logical_nulls());
+                        if let DataType::Union(_, _) = view.data_type() {
+                            assert_eq!(
+                                view.as_union().type_ids(),
+                                roundtrip[0].as_union().type_ids()
+                            );
+                        }
+                    }
+                    let compare =
+                        arrow_ord::ord::make_comparator(array.as_ref(), sliced.as_ref(), options)
+                            .unwrap();
+                    if matches!(array.data_type(), DataType::Struct(_) | DataType::List(_)) {
+                        assert!(compare(2, 5).is_eq());
+                        assert!(!compare(0, 1).is_eq());
+                    }
+                    for i in 0..array.len() {
+                        for j in 0..sliced.len() {
+                            assert_eq!(
+                                compare(i, j),
+                                rows.row(i).cmp(&sliced_rows.row(j)),
+                                "dense={dense}, {:?}, {options:?}, ({i}, {j})",
+                                array.data_type(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
